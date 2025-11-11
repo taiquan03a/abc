@@ -24,6 +24,8 @@ export default function Candidate() {
   const [audioLevel, setAudioLevel] = useState(0)
   const [loading, setLoading] = useState(false)
   const [error, setError] = useState(null)
+  const [aiStatus, setAiStatus] = useState(null) // Store AI monitoring status
+  const [recentAlerts, setRecentAlerts] = useState([]) // Store recent alerts
   const recordingServiceRef = useRef(new RecordingService())
   const cameraStreamRef = useRef(null)
   const screenStreamRef = useRef(null)
@@ -65,8 +67,10 @@ export default function Candidate() {
         sigRef.current = signaling
         
         signaling.on('answer', async (data) => {
-          if (data.to && data.to !== userId) return
+          // Accept answer from server (SFU mode) or from proctor (P2P mode)
+          if (data.to && data.to !== userId && data.from !== 'server') return
           if (pcRef.current) {
+            console.log('Received answer from:', data.from)
             await setRemoteDescription(pcRef.current, data.sdp)
           }
         })
@@ -93,6 +97,36 @@ export default function Candidate() {
         signaling.on('chat', (data) => {
           setMsgs(m => [...m, { from: data.from, text: data.text }])
         })
+        
+        // Listen for AI analysis updates (sent to proctor but we can also show to candidate)
+        signaling.on('ai_analysis', (data) => {
+          console.log('[Candidate] AI Analysis received:', data)
+          console.log('[Candidate] Current userId:', userId, 'Data candidate_id:', data.data?.candidate_id)
+          
+          // Only process if this is for current candidate
+          if (data.data?.candidate_id === userId) {
+            console.log('[Candidate] ✅ Processing AI analysis for this candidate')
+            setAiStatus(data.data)
+            
+            // If there are alerts, add to recent alerts (keep last 5)
+            if (data.data?.analyses) {
+              const alerts = data.data.analyses
+                .filter(a => a.result?.alert)
+                .map(a => ({
+                  ...a.result.alert,
+                  timestamp: data.data.timestamp
+                }))
+              
+              if (alerts.length > 0) {
+                console.log('[Candidate] ⚠️ Alerts found:', alerts.length)
+                setRecentAlerts(prev => [...alerts, ...prev].slice(0, 5))
+              }
+            }
+          } else {
+            console.log('[Candidate] ❌ Skipping - not for this candidate')
+          }
+        })
+        
         signaling.on('close', () => {
           setConnected(false)
         })
@@ -538,7 +572,14 @@ export default function Candidate() {
   }
 
   return (
-    <div style={{ padding: 16, maxWidth: 1400, margin: '0 auto' }}>
+    <>
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.3; }
+        }
+      `}</style>
+      <div style={{ padding: 16, maxWidth: 1400, margin: '0 auto' }}>
       <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: 16 }}>
         <h2>Exam Session - Candidate: {userId}</h2>
         <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
@@ -601,6 +642,41 @@ export default function Candidate() {
           <div style={{ fontSize: 12, color: '#666' }}>
             Đang kết nối đến server và khởi động camera/mic
           </div>
+        </div>
+      )}
+
+      {/* AI Monitoring Status Panel */}
+      {connected && aiStatus && (
+        <div style={{ 
+          padding: 12, 
+          background: recentAlerts.length > 0 ? '#fff3cd' : '#d4edda', 
+          border: `1px solid ${recentAlerts.length > 0 ? '#ffc107' : '#28a745'}`,
+          borderRadius: 8, 
+          marginBottom: 16 
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+            <span style={{ 
+              width: 10, 
+              height: 10, 
+              borderRadius: '50%', 
+              background: recentAlerts.length > 0 ? '#ff9800' : '#28a745',
+              animation: 'pulse 2s infinite'
+            }}></span>
+            <strong style={{ fontSize: 14 }}>🤖 AI đang theo dõi phiên thi của bạn</strong>
+          </div>
+          <div style={{ fontSize: 12, color: '#666' }}>
+            Trạng thái: <span style={{ fontWeight: 'bold' }}>{aiStatus.scenario === 'normal' ? '✓ Bình thường' : `⚠ ${aiStatus.scenario}`}</span>
+          </div>
+          {recentAlerts.length > 0 && (
+            <div style={{ marginTop: 8, paddingTop: 8, borderTop: '1px solid #ffc107' }}>
+              <div style={{ fontSize: 11, fontWeight: 'bold', color: '#856404', marginBottom: 4 }}>Cảnh báo gần đây:</div>
+              {recentAlerts.slice(0, 3).map((alert, idx) => (
+                <div key={idx} style={{ fontSize: 11, color: '#856404', marginBottom: 2 }}>
+                  • {alert.message}
+                </div>
+              ))}
+            </div>
+          )}
         </div>
       )}
 
@@ -854,6 +930,7 @@ export default function Candidate() {
       </div>
       )}
     </div>
+    </>
   )
 }
 

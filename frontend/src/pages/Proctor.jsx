@@ -1,7 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react'
 import { useParams } from 'react-router-dom'
 import { SignalingClient } from '../lib/signaling'
-import { createPeer, addLocalStream, createAndSetAnswer, setRemoteDescription } from '../lib/webrtc'
+import { createPeer, addLocalStream, createAndSetAnswer, createAndSetOffer, setRemoteDescription } from '../lib/webrtc'
 
 // Component để render video với auto-update khi stream thay đổi
 function CandidateVideo({ candidateId, stream, type, videoRefsRef, style }) {
@@ -89,6 +89,7 @@ export default function Proctor() {
   const [filterIncidents, setFilterIncidents] = useState(false)
   const [viewMode, setViewMode] = useState('grid') // grid, timeline
   const [selectedCandidate, setSelectedCandidate] = useState(null)
+  const [aiAnalysis, setAiAnalysis] = useState({}) // candidateId -> latest analysis results
 
   const localVideoRef = useRef(null)
   const pcsRef = useRef(new Map()) // candidateUserId -> RTCPeerConnection
@@ -101,6 +102,197 @@ export default function Proctor() {
     const init = async () => {
       const signaling = new SignalingClient({ baseUrl: SIGNALING_BASE, roomId, userId, role: 'proctor' })
       sigRef.current = signaling
+      
+      // Check if backend supports SFU mode
+      let sfuMode = false
+      try {
+        const healthResp = await fetch(`${SIGNALING_BASE}/health`)
+        const health = await healthResp.json()
+        sfuMode = health.sfu_enabled === true
+        console.log('Backend mode:', health.mode, 'SFU enabled:', sfuMode)
+      } catch (e) {
+        console.warn('Could not check SFU mode, defaulting to P2P')
+      }
+      
+      if (sfuMode) {
+        // SFU Mode: Proctor connects first, receives tracks as candidates join via renegotiation
+        console.log('=== SFU MODE ===')
+        
+        // Register message listeners BEFORE connecting
+        signaling.on('chat', (data) => {
+          setMsgs(m => [...m, { from: data.from, text: data.text }])
+        })
+        
+        signaling.on('incident', (data) => {
+          setIncidents(list => [...list, { ...data, id: Date.now() + Math.random() }])
+        })
+        
+        signaling.on('ai_analysis', (data) => {
+          console.log('[AI Analysis] Received:', data)
+          // Store latest analysis for this candidate
+          setAiAnalysis(prev => ({
+            ...prev,
+            [data.data?.candidate_id || 'unknown']: data.data
+          }))
+          
+          // If there are alerts, add them as incidents
+          if (data.data?.analyses) {
+            data.data.analyses.forEach(analysis => {
+              const alert = analysis.result?.alert
+              if (alert) {
+                console.log('[AI Analysis] Alert:', alert)
+                setIncidents(list => [...list, {
+                  id: Date.now() + Math.random(),
+                  userId: data.data.candidate_id,
+                  type: alert.type,
+                  level: alert.level,
+                  message: alert.message,
+                  timestamp: data.data.timestamp
+                }])
+              }
+            })
+          }
+        })
+        
+        await signaling.connect()
+        
+        console.log('Proctor establishing SFU connection (will receive tracks when candidates join)')
+        
+        // Create single peer connection to backend
+        const peer = await createPeer({
+          onTrack: (ev) => {
+            console.log('=== SFU onTrack ===', ev)
+            const track = ev.track
+            console.log('Received track from SFU:', {
+              trackId: track.id,
+              trackKind: track.kind,
+              trackLabel: track.label,
+              streamId: ev.streams?.[0]?.id
+            })
+            
+            // In SFU mode, all tracks come through one connection
+            // We need to differentiate between camera and screen tracks
+            
+            if (track.kind === 'video') {
+              // Get or create stream for this track
+              const stream = ev.streams?.[0] || new MediaStream([track])
+              
+              console.log('Processing video track:', {
+                trackId: track.id,
+                streamId: stream.id,
+                streamTrackCount: stream.getTracks().length
+              })
+              
+              // Count existing video tracks to determine if this is camera or screen
+              // First video track = camera, second = screen
+              setRemoteStreams(prev => {
+                const current = prev['sfu-all'] || { camera: null, screen: null }
+                
+                // Check if this track already exists in our state
+                const existingCameraTracks = current.camera?.getVideoTracks() || []
+                const existingScreenTracks = current.screen?.getVideoTracks() || []
+                
+                const isInCamera = existingCameraTracks.some(t => t.id === track.id)
+                const isInScreen = existingScreenTracks.some(t => t.id === track.id)
+                
+                if (isInCamera || isInScreen) {
+                  console.log('Track already added, skipping')
+                  return prev
+                }
+                
+                // Determine if this is camera or screen
+                let newState = { ...current }
+                
+                if (!current.camera) {
+                  // First video track = camera
+                  newState.camera = new MediaStream([track])
+                  console.log('Added camera stream:', newState.camera.id)
+                } else if (!current.screen) {
+                  // Second video track = screen
+                  newState.screen = new MediaStream([track])
+                  console.log('Added screen stream:', newState.screen.id)
+                } else {
+                  // Already have both - this is likely a replacement
+                  console.log('Replacing screen stream with new track')
+                  newState.screen = new MediaStream([track])
+                }
+                
+                return {
+                  ...prev,
+                  'sfu-all': newState
+                }
+              })
+            } else if (track.kind === 'audio') {
+              // Handle audio track
+              const stream = ev.streams?.[0] || new MediaStream([track])
+              setRemoteStreams(prev => ({
+                ...prev,
+                'sfu-all': {
+                  ...(prev['sfu-all'] || {}),
+                  audio: stream
+                }
+              }))
+              console.log('Added audio stream')
+            }
+          },
+          onIce: (candidate) => {
+            console.log('Proctor ICE candidate:', candidate)
+            signaling.send({ type: 'ice', candidate })
+          }
+        })
+        
+        pcsRef.current.set('server', peer.pc)
+        
+        // Create and send offer to backend
+        const offer = await createAndSetOffer(peer.pc)
+        console.log('Sending offer to SFU backend', offer)
+        signaling.send({ 
+          type: 'offer', 
+          sdp: { 
+            sdp: offer.sdp, 
+            type: offer.type 
+          } 
+        })
+        
+        // Wait for answer from backend
+        signaling.on('answer', async (data) => {
+          if (data.from === 'server') {
+            console.log('Received answer from SFU backend')
+            await setRemoteDescription(peer.pc, data.sdp)
+          }
+        })
+        
+        // Handle renegotiation offers from backend (when new candidates join)
+        signaling.on('offer', async (data) => {
+          if (data.from === 'server' && data.renegotiate) {
+            console.log('[RENEGOTIATE] Received new offer from backend due to candidate join')
+            
+            // Set remote description (new offer)
+            await peer.pc.setRemoteDescription(new RTCSessionDescription({
+              type: data.sdp.type,
+              sdp: data.sdp.sdp
+            }))
+            
+            // Create answer
+            const answer = await peer.pc.createAnswer()
+            await peer.pc.setLocalDescription(answer)
+            
+            // Send answer back to backend
+            signaling.send({
+              type: 'answer',
+              sdp: {
+                type: answer.type,
+                sdp: answer.sdp
+              }
+            })
+            console.log('[RENEGOTIATE] Sent answer back to backend')
+          }
+        })
+        
+      } else {
+        // P2P Mode: Original logic (receive offers from candidates)
+        console.log('=== P2P MODE ===')
+        
       signaling.on('offer', async (data) => {
         const candidateId = data.from
         const trackInfo = data.trackInfo || [] // Track metadata from candidate
@@ -389,6 +581,32 @@ export default function Proctor() {
       signaling.on('incident', (data) => {
         setIncidents(list => [...list, { ...data, id: Date.now() + Math.random() }])
       })
+      signaling.on('ai_analysis', (data) => {
+        console.log('[AI Analysis] Received:', data)
+        // Store latest analysis for this candidate
+        setAiAnalysis(prev => ({
+          ...prev,
+          [data.candidate_id || 'unknown']: data
+        }))
+        
+        // If there are alerts, add them as incidents
+        if (data.analyses) {
+          data.analyses.forEach(analysis => {
+            const alert = analysis.result?.alert
+            if (alert) {
+              console.log('[AI Analysis] Alert:', alert)
+              setIncidents(list => [...list, {
+                id: Date.now() + Math.random(),
+                userId: data.candidate_id,
+                type: alert.type,
+                level: alert.level,
+                message: alert.message,
+                timestamp: data.timestamp
+              }])
+            }
+          })
+        }
+      })
       await signaling.connect()
 
       // Optional: Proctor can also send mic for talk-back on each pc created later
@@ -398,6 +616,8 @@ export default function Proctor() {
         // Attach to future PCs upon creation
         pcsRef.current.__talkbackStream = stream
       } catch {}
+      
+      } // End of P2P mode else block
     }
     init()
     return () => {
@@ -489,7 +709,14 @@ export default function Proctor() {
   }, {})
 
   return (
-    <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 16 }}>
+    <>
+      <style>{`
+        @keyframes pulse {
+          0%, 100% { opacity: 1; }
+          50% { opacity: 0.3; }
+        }
+      `}</style>
+      <div style={{ display: 'grid', gridTemplateColumns: '2fr 1fr', gap: 16 }}>
       <div>
         <h3>Proctor: {userId}</h3>
         {focusedId ? (
@@ -550,10 +777,37 @@ export default function Proctor() {
                 const s2Count = candIncidents.filter(i => i.level === 'S2').length
                 const cameraStream = streams?.camera || null
                 const screenStream = streams?.screen || null
+                const analysis = aiAnalysis[uid]
                 
                 return (
                   <div key={uid} style={{ position: 'relative', border: selectedCandidate === uid ? '2px solid #007bff' : '1px solid #ddd', borderRadius: 8, padding: 8, background: '#f8f9fa' }}>
                     <div style={{ marginBottom: 4, fontSize: 12, fontWeight: 'bold' }}>Candidate: {uid}</div>
+                    {/* AI Analysis Status Badge */}
+                    {analysis && (
+                      <div style={{ 
+                        position: 'absolute', 
+                        top: 8, 
+                        left: 8, 
+                        background: 'rgba(0,0,0,0.7)', 
+                        color: 'white', 
+                        padding: '4px 8px', 
+                        borderRadius: 4, 
+                        fontSize: 10,
+                        zIndex: 20,
+                        display: 'flex',
+                        alignItems: 'center',
+                        gap: 4
+                      }}>
+                        <span style={{ 
+                          width: 6, 
+                          height: 6, 
+                          borderRadius: '50%', 
+                          background: '#4ade80',
+                          animation: 'pulse 2s infinite'
+                        }}></span>
+                        AI: {analysis.scenario}
+                      </div>
+                    )}
                     <div style={{ display: 'grid', gridTemplateColumns: screenStream ? '1fr 1fr' : '1fr', gap: 8 }}>
                       {/* Camera View */}
                       <div style={{ position: 'relative' }}>
@@ -653,12 +907,48 @@ export default function Proctor() {
         </div>
       </div>
       <div>
-        <h4>Incidents</h4>
-        <textarea placeholder="Ghi chú" value={note} onChange={e=>setNote(e.target.value)} style={{ width: '100%', height: 64 }} />
-        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-          {INCIDENT_TAGS.map(t => (
-            <button key={t.code} onClick={() => tagIncident(t)}>{t.code}</button>
-          ))}
+        <h4>AI Analysis & Incidents</h4>
+        
+        {/* AI Analysis Status Panel */}
+        <div style={{ marginBottom: 12, padding: 8, background: '#f0f8ff', border: '1px solid #b3d9ff', borderRadius: 4 }}>
+          <div style={{ fontSize: 12, fontWeight: 'bold', marginBottom: 6, color: '#0066cc' }}>🤖 AI Monitoring Status</div>
+          {Object.keys(aiAnalysis).length === 0 ? (
+            <div style={{ fontSize: 11, color: '#666' }}>Chờ thí sinh kết nối...</div>
+          ) : (
+            <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+              {Object.entries(aiAnalysis).map(([candidateId, analysis]) => {
+                const hasAlert = analysis?.analyses?.some(a => a.result?.alert)
+                const alertCount = analysis?.analyses?.filter(a => a.result?.alert).length || 0
+                return (
+                  <div key={candidateId} style={{ 
+                    display: 'flex', 
+                    alignItems: 'center', 
+                    gap: 8,
+                    padding: 6,
+                    background: hasAlert ? '#fff3cd' : 'white',
+                    borderRadius: 4,
+                    fontSize: 11
+                  }}>
+                    <span style={{ 
+                      width: 8, 
+                      height: 8, 
+                      borderRadius: '50%', 
+                      background: hasAlert ? '#ff9800' : '#4ade80',
+                      animation: 'pulse 2s infinite'
+                    }}></span>
+                    <span style={{ fontWeight: 'bold' }}>{candidateId}</span>
+                    <span style={{ color: '#666' }}>→</span>
+                    <span>{analysis?.scenario || 'unknown'}</span>
+                    {alertCount > 0 && (
+                      <span style={{ marginLeft: 'auto', color: '#ff9800', fontWeight: 'bold' }}>
+                        ⚠️ {alertCount} alert{alertCount > 1 ? 's' : ''}
+                      </span>
+                    )}
+                  </div>
+                )
+              })}
+            </div>
+          )}
         </div>
         <div style={{ marginBottom: 8 }}>
           <button onClick={() => setViewMode('grid')} style={{ marginRight: 4, background: viewMode === 'grid' ? '#007bff' : '#f0f0f0' }}>Grid</button>
@@ -677,12 +967,12 @@ export default function Proctor() {
                 }}>
                   <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center' }}>
                     <div>
-                      <strong>{it.tag}</strong> <span style={{ color: getSeverityColor(it.level), fontWeight: 'bold' }}>({it.level})</span>
-                      <div style={{ fontSize: 11, color: '#666' }}>by {it.by || it.from}</div>
+                      <strong>{it.tag || it.type}</strong> <span style={{ color: getSeverityColor(it.level), fontWeight: 'bold' }}>({it.level})</span>
+                      <div style={{ fontSize: 11, color: '#666' }}>by {it.by || it.from || it.userId}</div>
                     </div>
-                    <div style={{ fontSize: 11, color: '#999' }}>{new Date(it.ts).toLocaleTimeString()}</div>
+                    <div style={{ fontSize: 11, color: '#999' }}>{new Date(it.ts || it.timestamp).toLocaleTimeString()}</div>
                   </div>
-                  <div style={{ fontSize: 12, marginTop: 4 }}>{it.note}</div>
+                  <div style={{ fontSize: 12, marginTop: 4 }}>{it.message || it.note}</div>
                   {it.escalated && <div style={{ fontSize: 11, color: '#999' }}>Escalated: {it.escalated}x</div>}
                 </div>
               ))}
@@ -697,14 +987,17 @@ export default function Proctor() {
                   borderBottom: '1px solid #f0f0f0',
                   borderLeft: `3px solid ${getSeverityColor(it.level)}`
                 }}>
-                  <div><b>{it.tag}</b> <span style={{ color: getSeverityColor(it.level), fontWeight: 'bold' }}>({it.level})</span> by {it.by || it.from}</div>
-                  <div style={{ fontSize: 12, color: '#555' }}>{new Date(it.ts).toLocaleTimeString()} - {it.note}</div>
+                  <div><b>{it.tag || it.type}</b> <span style={{ color: getSeverityColor(it.level), fontWeight: 'bold' }}>({it.level})</span> by {it.by || it.from || it.userId}</div>
+                  <div style={{ fontSize: 12, color: '#555' }}>
+                    {new Date(it.ts || it.timestamp).toLocaleTimeString()} - {it.message || it.note}
+                  </div>
                 </div>
               ))}
           </div>
         )}
       </div>
     </div>
+    </>
   )
 }
 

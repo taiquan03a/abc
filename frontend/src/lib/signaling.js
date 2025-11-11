@@ -46,8 +46,10 @@ export class SignalingClient {
         this.ws.onmessage = (ev) => {
           try {
             const data = JSON.parse(ev.data)
+            console.log('[SignalingClient] Received message:', data.type, data)
             const handler = this.listeners.get(data.type)
             if (handler) handler(data)
+            else console.warn('[SignalingClient] No handler for message type:', data.type)
           } catch (e) {
             console.error('Failed to parse message:', e)
           }
